@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  payment-processor:
+    container_name: payment-processor
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - RUST_LOG=info
