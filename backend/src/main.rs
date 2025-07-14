@@ -1,153 +1,224 @@
+#![allow(non_snake_case)]
+
 use actix_web::middleware::Logger;
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use redis::AsyncCommands;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor, PgPool};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::Mutex;
 use uuid::Uuid;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize, Serialize, Clone)]
 struct Request {
-    correlation_id: Uuid,
+    correlationId: Uuid,
     amount: f64,
 }
 
-#[derive(Serialize, sqlx::FromRow, Clone)]
-struct PaymentResponse {
-    correlation_id: Uuid,
-    amount: f64,
-}
 struct QueueState {
     last_written_id: AtomicU64,
     next_seq_id: AtomicU64,
 }
 
-#[post("/payments")]
-async fn post_payments(
-    req_body: web::Json<Request>,
-    sender: web::Data<Sender<(u64, Request)>>,
-    state: web::Data<Arc<QueueState>>,
-) -> impl Responder {
-    let payload = req_body.into_inner();
-    let seq_id = state.next_seq_id.fetch_add(1, Ordering::SeqCst);
+#[derive(Clone)]
+struct ApiHealthState {
+    is_healthy: Arc<AtomicBool>,
+    last_checked: Arc<AtomicU64>,
+    min_response_time: Arc<AtomicU64>,
+    url: String,
+    health_url: String,
+}
 
-    if let Err(err) = sender.send((seq_id, payload)).await {
-        eprintln!("Queue error: {}", err);
-        return HttpResponse::InternalServerError().body("Failed to enqueue payment");
+impl ApiHealthState {
+    fn new(url: &str, health_url: &str) -> Self {
+        Self {
+            is_healthy: Arc::new(AtomicBool::new(true)),
+            last_checked: Arc::new(AtomicU64::new(0)),
+            min_response_time: Arc::new(AtomicU64::new(0)),
+            url: url.to_string(),
+            health_url: health_url.to_string(),
+        }
     }
 
-    HttpResponse::Created().finish()
+    fn should_check(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        now.saturating_sub(self.last_checked.load(Ordering::SeqCst)) > 5000
+    }
+
+    async fn check_health(&self, client: &Client) {
+        if self.should_check() {
+            match client.get(&self.health_url).send().await {
+                Ok(resp) => {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        let min_time = body["minResponseTime"].as_u64().unwrap_or(0);
+                        let failing = body["failing"].as_bool().unwrap_or(true);
+                        self.is_healthy.store(!failing, Ordering::SeqCst);
+                        self.min_response_time.store(min_time, Ordering::SeqCst);
+                    }
+                }
+                Err(_) => {
+                    self.is_healthy.store(false, Ordering::SeqCst);
+                }
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            self.last_checked.store(now, Ordering::SeqCst);
+        }
+    }
+}
+
+#[post("/payments")]
+async fn post_payments(
+    req_body: String,
+    sender: web::Data<Sender<String>>,
+    redis_conn: web::Data<Arc<Mutex<redis::aio::Connection>>>,
+) -> impl Responder {
+    let sender = sender.clone();
+    let redis_conn = redis_conn.clone();
+
+    tokio::spawn(async move {
+        if let Err(err) = sender.send(req_body.clone()).await {
+            eprintln!("Queue error, pushing to Redis fallback queue: {}", err);
+            let mut conn = redis_conn.lock().await;
+            let _: redis::RedisResult<()> = conn.rpush("fallback:payments", req_body).await;
+        }
+    });
+
+    HttpResponse::Accepted().finish()
 }
 
 #[get("/payments-summary")]
 async fn get_payments_summary(
-    db: web::Data<PgPool>,
+    redis_conn: web::Data<Arc<Mutex<redis::aio::Connection>>>,
     state: web::Data<Arc<QueueState>>,
 ) -> impl Responder {
     let expected_id = state.next_seq_id.load(Ordering::SeqCst).saturating_sub(1);
 
     while state.last_written_id.load(Ordering::SeqCst) < expected_id {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    match sqlx::query_as::<_, PaymentResponse>("SELECT * FROM payments")
-        .fetch_all(db.get_ref())
-        .await
-    {
-        Ok(payments) => HttpResponse::Ok().json(payments),
+    let mut conn = redis_conn.lock().await;
+    let values: Vec<String> = match conn.hvals("payments").await {
+        Ok(v) => v,
         Err(err) => {
-            eprintln!("DB read error: {}", err);
-            HttpResponse::InternalServerError().body("Failed to fetch payments")
+            eprintln!("Redis read error: {}", err);
+            return HttpResponse::InternalServerError().body("Failed to fetch payments");
         }
-    }
+    };
+
+    let payments: Vec<Request> = values
+        .into_iter()
+        .filter_map(|v| serde_json::from_str(&v).ok())
+        .collect();
+
+    HttpResponse::Ok().json(payments)
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
 
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let external_api_url =
-        env::var("EXTERNAL_DEFAULT_API_URL").expect("EXTERNAL_DEFAULT_API_URL must be set");
+    let default_url = env::var("EXTERNAL_DEFAULT_API_URL").expect("EXTERNAL_DEFAULT_API_URL must be set");
+    let default_health = env::var("EXTERNAL_DEFAULT_API_HEALTH_URL").expect("EXTERNAL_DEFAULT_API_HEALTH_URL must be set");
+    let fallback_url = env::var("EXTERNAL_FALLBACK_API_URL").expect("EXTERNAL_FALLBACK_API_URL must be set");
+    let fallback_health = env::var("EXTERNAL_FALLBACK_API_HEALTH_URL").expect("EXTERNAL_FALLBACK_API_HEALTH_URL must be set");
+    let redis_url: String = env::var("REDIS_URL").expect("REDIS_URL must be set");
 
     let client = Arc::new(Client::new());
-    let db = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to DB");
+    let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
+    let redis_conn = Arc::new(Mutex::new(redis_client.get_async_connection().await.expect("Failed to connect to Redis")));
 
-    db.execute("CREATE TABLE IF NOT EXISTS payments (correlation_id UUID, amount FLOAT)")
-        .await
-        .expect("Failed to create table");
+    let default_api = ApiHealthState::new(&default_url, &default_health);
+    let fallback_api = ApiHealthState::new(&fallback_url, &fallback_health);
 
-    let (tx_stage1, mut rx_stage1) = mpsc::channel::<(u64, Request)>(100);
-    let (tx_stage2, mut rx_stage2) = mpsc::channel::<(u64, PaymentResponse)>(100);
+    let (tx_stage1, mut rx_stage1) = mpsc::channel::<String>(100);
+    let (tx_stage2, mut rx_stage2) = mpsc::channel::<(u64, Request)>(100);
     let state = Arc::new(QueueState {
         last_written_id: AtomicU64::new(0),
         next_seq_id: AtomicU64::new(0),
     });
 
     let client_clone = client.clone();
+    let default_api_clone = default_api.clone();
+    let fallback_api_clone = fallback_api.clone();
+    let state_clone_for_stage1 = state.clone();
+
     tokio::spawn(async move {
-        while let Some((id, payload)) = rx_stage1.recv().await {
-            let res = client_clone
-                .post(&external_api_url)
-                .json(&payload)
-                .send()
-                .await;
+        while let Some(json_str) = rx_stage1.recv().await {
+            let payload: Request = match serde_json::from_str(&json_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Invalid JSON payload: {e}");
+                    continue;
+                }
+            };
 
-            if let Ok(response) = res {
-                let json: serde_json::Value = match response.json().await {
-                    Ok(val) => val,
-                    Err(err) => {
-                        eprintln!("Failed to parse response JSON: {err}");
-                        continue;
-                    }
-                };
+            let id = state_clone_for_stage1.next_seq_id.fetch_add(1, Ordering::SeqCst);
 
-                let parsed: serde_json::Value =
-                    match serde_json::from_str(json.to_string().as_str()) {
-                        Ok(val) => val,
-                        Err(err) => {
-                            eprintln!("Failed to parse inner JSON string: {}", err);
-                            continue;
-                        }
-                    };
+            default_api_clone.check_health(&client_clone).await;
+            fallback_api_clone.check_health(&client_clone).await;
 
-                let record = PaymentResponse {
-                    correlation_id: Uuid::parse_str(
-                        parsed
-                            .get("correlation_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default(),
-                    )
-                    .unwrap_or_else(|_| Uuid::nil()),
-                    amount: parsed.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                };
+            let use_fallback = !default_api_clone.is_healthy.load(Ordering::SeqCst)
+                || default_api_clone.min_response_time.load(Ordering::SeqCst) > 1000;
 
-                let _ = tx_stage2.send((id, record)).await;
+            let primary_url = if use_fallback && fallback_api_clone.is_healthy.load(Ordering::SeqCst) {
+                &fallback_api_clone.url
             } else {
-                eprintln!("Failed to call external API for ID {}", id);
+                &default_api_clone.url
+            };
+
+            let res = client_clone.post(primary_url).json(&payload).send().await;
+
+            if res.is_ok() {
+                let _ = tx_stage2.send((id, payload)).await;
+            } else {
+                eprintln!("Both APIs failed or unavailable for ID {}", id);
             }
         }
     });
 
-    let db_clone = db.clone();
+    let redis_conn_clone = redis_conn.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
-        while let Some((id, payment)) = rx_stage2.recv().await {
-            let _ = sqlx::query("INSERT INTO payments (correlation_id, amount) VALUES ($1, $2)")
-                .bind(payment.correlation_id)
-                .bind(payment.amount)
-                .execute(&db_clone)
-                .await;
+        while let Some((id, request)) = rx_stage2.recv().await {
+            let mut conn = redis_conn_clone.lock().await;
+            let _: () = conn.hset(
+                "payments",
+                request.correlationId.to_string(),
+                serde_json::to_string(&request).unwrap(),
+            ).await.unwrap();
 
             state_clone.last_written_id.store(id, Ordering::SeqCst);
+        }
+    });
+
+    let redis_conn_clone_for_fallback = redis_conn.clone();
+    let tx_stage1_clone = tx_stage1.clone();
+    tokio::spawn(async move {
+        loop {
+            let mut conn = redis_conn_clone_for_fallback.lock().await;
+            let fallback_payload: Option<String> = conn.lpop("fallback:payments", None).await.ok().flatten();
+            drop(conn);
+
+            if let Some(json_str) = fallback_payload {
+                if let Err(e) = tx_stage1_clone.send(json_str.clone()).await {
+                    eprintln!("Failed to requeue fallback payload: {e}");
+                    let mut conn = redis_conn_clone_for_fallback.lock().await;
+                    let _: redis::RedisResult<()> = conn.rpush("fallback:payments", json_str).await;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
     });
 
@@ -155,7 +226,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(db.clone()))
+            .app_data(web::Data::new(redis_conn.clone()))
             .app_data(web::Data::new(client.clone()))
             .app_data(web::Data::new(tx_stage1.clone()))
             .app_data(web::Data::new(state.clone()))

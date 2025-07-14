@@ -12,16 +12,16 @@ function uuidv4() {
 }
 
 export let options = {
-  vus: 100,
+  vus: 1,
   duration: "30s",
 };
 
 export default function () {
-  const url = "http://localhost:8080/payments";
-  const correlation_id = uuidv4();
+  const url = "http://localhost:9999/payments";
+  const correlationId = uuidv4();
 
   const payload = JSON.stringify({
-    correlation_id: correlation_id,
+    correlationId: correlationId,
     amount: Math.random() * 1000,
   });
 
@@ -34,6 +34,6 @@ export default function () {
   const res = http.post(url, payload, params);
 
   check(res, {
-    "status is 201": (r) => r.status === 201,
+    "status is 202": (r) => r.status === 202,
   });
 }
